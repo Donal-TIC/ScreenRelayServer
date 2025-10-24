@@ -2,123 +2,85 @@ const WebSocket = require('ws');
 const server = require('http').createServer();
 const wss = new WebSocket.Server({ server });
 
-// Stockage des connexions
-const streams = new Map();    // deviceId -> WebSocket (streamers)
-const viewers = new Map();    // WebSocket -> targetDeviceId (viewers)
+// Stockage simple - un seul streamer à la fois
+let currentStreamer = null;
+const viewers = new Set();
 
-console.log('🚀 Screen Relay Server starting...');
+console.log('🚀 Screen Relay Server starting - SINGLE STREAM MODE...');
 
 wss.on('connection', (ws, request) => {
     console.log('🔗 New client connected');
     
-    // Déterminer le type de client basé sur l'URL
     const url = request.url;
-    let clientType = 'unknown';
     
     if (url.includes('/stream')) {
-        clientType = 'streamer';
+        // Streamer qui se connecte
+        handleStreamerConnection(ws);
     } else if (url.includes('/view')) {
-        clientType = 'viewer';
+        // Viewer qui se connecte
+        handleViewerConnection(ws);
     }
-    
-    console.log(`📱 Client type: ${clientType}`);
-
-    ws.on('message', (data) => {
-        try {
-            if (typeof data === 'string') {
-                // Message texte JSON
-                const message = JSON.parse(data);
-                handleTextMessage(ws, message, clientType);
-            } else {
-                // Données binaires (images)
-                handleBinaryData(ws, data);
-            }
-        } catch (error) {
-            console.error('❌ Error processing message:', error);
-        }
-    });
 
     ws.on('close', () => {
-        console.log('🔌 Client disconnected');
-        cleanupConnection(ws, clientType);
+        cleanupConnection(ws);
     });
 
     ws.on('error', (error) => {
         console.error('💥 WebSocket error:', error);
-        cleanupConnection(ws, clientType);
+        cleanupConnection(ws);
     });
-
-    // Accuser réception de la connexion
-    ws.send(JSON.stringify({ 
-        type: 'connected', 
-        status: 'ok',
-        clientType: clientType 
-    }));
 });
 
-function handleTextMessage(ws, message, clientType) {
-    console.log(`📨 Received message from ${clientType}:`, message.type);
+function handleStreamerConnection(ws) {
+    // Remplace le streamer précédent
+    if (currentStreamer) {
+        currentStreamer.close();
+    }
+    
+    currentStreamer = ws;
+    console.log('🎥 New streamer registered');
+    
+    ws.send(JSON.stringify({ 
+        type: 'registered', 
+        status: 'success',
+        message: 'You are now streaming'
+    }));
 
-    switch (message.type) {
-        case 'register':
-            if (clientType === 'streamer' && message.deviceId) {
-                // Un streamer s'enregistre
-                streams.set(message.deviceId, ws);
-                console.log(`🎥 Streamer registered: ${message.deviceId}`);
-                ws.send(JSON.stringify({ 
-                    type: 'registered', 
-                    status: 'success',
-                    deviceId: message.deviceId 
-                }));
-            }
-            break;
+    // Notifier tous les viewers qu'un nouveau stream est disponible
+    viewers.forEach(viewerWs => {
+        if (viewerWs.readyState === 1) {
+            viewerWs.send(JSON.stringify({
+                type: 'stream_available',
+                message: 'Stream is live'
+            }));
+        }
+    });
+}
 
-        case 'view':
-            if (clientType === 'viewer' && message.targetDevice) {
-                // Un viewer demande un stream spécifique
-                viewers.set(ws, message.targetDevice);
-                console.log(`👀 Viewer wants to watch: ${message.targetDevice}`);
-
-                // Vérifier si le stream existe
-                const streamerWs = streams.get(message.targetDevice);
-                if (streamerWs && streamerWs.readyState === 1) {
-                    ws.send(JSON.stringify({ 
-                        type: 'stream_available', 
-                        status: 'ok',
-                        targetDevice: message.targetDevice 
-                    }));
-                    console.log(`✅ Stream available for viewer`);
-                } else {
-                    ws.send(JSON.stringify({ 
-                        type: 'no_stream', 
-                        status: 'error',
-                        message: 'Stream not available' 
-                    }));
-                    console.log(`❌ Stream not available: ${message.targetDevice}`);
-                }
-            }
-            break;
-
-        default:
-            console.log('🤷 Unknown message type:', message.type);
+function handleViewerConnection(ws) {
+    viewers.add(ws);
+    console.log(`👀 New viewer connected. Total viewers: ${viewers.size}`);
+    
+    // Dire au viewer si un stream est disponible
+    if (currentStreamer && currentStreamer.readyState === 1) {
+        ws.send(JSON.stringify({
+            type: 'stream_available',
+            message: 'Connected to live stream'
+        }));
+    } else {
+        ws.send(JSON.stringify({
+            type: 'no_stream',
+            message: 'Waiting for streamer...'
+        }));
     }
 }
 
 function handleBinaryData(ws, data) {
-    // Trouver quel streamer envoie les données
-    let streamerDeviceId = null;
-    for (const [deviceId, streamWs] of streams.entries()) {
-        if (streamWs === ws) {
-            streamerDeviceId = deviceId;
-            break;
-        }
-    }
-
-    if (streamerDeviceId) {
-        // Rediriger les données à tous les viewers de ce streamer
+    // Si c'est le streamer qui envoie des données, les rediriger à tous les viewers
+    if (ws === currentStreamer) {
         let viewerCount = 0;
-        viewers.forEach((targetDeviceId, viewerWs) => {
-            if (targetDeviceId === streamerDeviceId && viewerWs.readyState === 1) {
+        viewers.forEach(viewerWs => {
+            if (viewerWs.readyState === 1) {
                 viewerWs.send(data);
                 viewerCount++;
             }
@@ -130,36 +92,45 @@ function handleBinaryData(ws, data) {
     }
 }
 
-function cleanupConnection(ws, clientType) {
-    if (clientType === 'streamer') {
-        // Supprimer des streams
-        for (const [deviceId, streamWs] of streams.entries()) {
-            if (streamWs === ws) {
-                streams.delete(deviceId);
-                console.log(`🗑️ Streamer removed: ${deviceId}`);
-                
-                // Notifier les viewers
-                notifyViewersStreamEnded(deviceId);
-                break;
+function cleanupConnection(ws) {
+    if (ws === currentStreamer) {
+        currentStreamer = null;
+        console.log('🗑️ Streamer disconnected');
+        
+        // Notifier les viewers
+        viewers.forEach(viewerWs => {
+            if (viewerWs.readyState === 1) {
+                viewerWs.send(JSON.stringify({
+                    type: 'stream_ended',
+                    message: 'Stream ended'
+                }));
             }
-        }
-    } else if (clientType === 'viewer') {
-        // Supprimer des viewers
-        viewers.delete(ws);
-        console.log('🗑️ Viewer removed');
+        });
     }
+    
+    viewers.delete(ws);
 }
 
-function notifyViewersStreamEnded(deviceId) {
-    viewers.forEach((targetDeviceId, viewerWs) => {
-        if (targetDeviceId === deviceId && viewerWs.readyState === 1) {
-            viewerWs.send(JSON.stringify({
-                type: 'stream_ended',
-                message: 'Stream has ended'
-            }));
+// Gestion des messages (texte et binaire)
+wss.on('connection', (ws, request) => {
+    const url = request.url;
+    
+    ws.on('message', (data) => {
+        try {
+            if (typeof data === 'string') {
+                const message = JSON.parse(data);
+                console.log('📨 Message:', message);
+            } else {
+                // Données binaires (images)
+                handleBinaryData(ws, data);
+            }
+        } catch (error) {
+            console.error('❌ Error processing message:', error);
         }
     });
-}
+
+    // ... reste du code de connection
+});
 
 // Démarrer le serveur
 const PORT = process.env.PORT || 3000;
@@ -170,25 +141,13 @@ server.listen(PORT, () => {
     console.log(`   - Viewers:   ws://localhost:${PORT}/view`);
 });
 
-// Nettoyer les connexions mortes périodiquement
+// Nettoyage périodique
 setInterval(() => {
-    const now = Date.now();
-    
-    // Nettoyer les streams
-    streams.forEach((ws, deviceId) => {
-        if (ws.readyState !== 1) {
-            streams.delete(deviceId);
-            console.log(`🧹 Cleaned up dead stream: ${deviceId}`);
-        }
-    });
-    
-    // Nettoyer les viewers
-    viewers.forEach((targetDeviceId, ws) => {
+    viewers.forEach(ws => {
         if (ws.readyState !== 1) {
             viewers.delete(ws);
-            console.log('🧹 Cleaned up dead viewer');
         }
     });
     
-    console.log(`📈 Stats: ${streams.size} streams, ${viewers.size} viewers`);
-}, 30000); // Toutes les 30 secondes
+    console.log(`📈 Stats: ${currentStreamer ? '1 streamer' : 'no streamer'}, ${viewers.size} viewers`);
+}, 30000);
